@@ -1,25 +1,30 @@
-// ======================= TIME-TRAVEL DEBUGGER  =======================
+/*
+    I want this project to compile on Windows, Linux and Mac Os
+    so I will add the libraries manually
+*/
 
-// Pipeline this file implements, top to bottom:
-//   0. Receive  -- stream the client's .trace bytes straight to source.bin on disk
-//   1. Pass 0X0   -- validity check (FUNC/FUNC_END matching)
-//   2. Pass 0X1   -- resolve(): copy EVERY source line into resolve.bin as [offset][size][string], then patch CALL targets.
-//   3. Pass 0X2   -- execute resolve.bin: tokenize ONE line at a time, update the call stack, take a snapshot -> Timeline
-//   4. Pass 0X3   -- serialize Timeline -> session.tdbg(header + snapshot records + dense index)
+// ------------------------------- STANDARD LIBRARIES -----------------------------
 
 #include <iostream>
 #include <string>
-#include <cstdint>
 #include <fstream>
-#include <unistd.h>
-#include <sys/socket.h>
+#include <vector>
+#include <stdexcept>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 #include <exception>
+
+//----------------------------------- Windows only ---------------------------------
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else // Mac and Linux
+#include <unistd.h>
+#include <sys/socket.h>
+#endif
+
 using namespace std;
 
-// ---- Constants ----
 const int32_t MAX_VARS_PER_FRAME = 16;
 const int32_t MAX_STACK_DEPTH = 64;
 const int32_t MAX_FUNCS = 128;
@@ -27,11 +32,8 @@ const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2; // kW + func_name + upto 16 p
 const int32_t MAX_PATCHES = MAX_FUNCS * 4;
 const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024; // sanity cap on the declared file length
 const int32_t IO_BUFFER_SIZE = 64 * 1024;              // fixed buffer for streaming to/from disk
-const int32_t SOCKET_TIMEOUT_SEC = 5;                  // TODO: apply as SO_RCVTIMEO so a deadclient can't hang the server forever
+const int32_t SOCKET_TIMEOUT_SEC = 5;                  //  apply as SO_RCVTIMEO so a deadclient can't hang the server forever
 
-// ---- Custom data structures
-
-// Stack: back the live Call Stack during execution
 template <typename T>
 class Stack
 {
@@ -46,20 +48,14 @@ class Stack
     int32_t count;
 
 public:
-    // Implement these functions:
-    Stack()
-    { // initialize the stack
-
-        top = nullptr;
-        count = 0;
-    }
+    Stack() : top(nullptr), count(0) {}
     void push(const T &val)
     {
         if (count == MAX_STACK_DEPTH)
         {
             throw(std::overflow_error("Maximum deapth Reached!"));
         }
-        newNode = new Node(val);
+        Node *newNode = new Node(val);
         count++;
         if (top == nullptr)
         {
@@ -115,13 +111,18 @@ public:
     }
 };
 
-// Timeline : doubly linked list of Snapshots
-struct Snapshot; // fwd declaration;
+struct Snapshot;
 struct TimelineNode
 {
     Snapshot *data;
     TimelineNode *next;
     TimelineNode *prev;
+
+    TimelineNode(Snapshot *_data)
+    {
+        data = _data;
+        next = prev = nullptr;
+    }
 };
 class Timeline
 {
@@ -129,23 +130,40 @@ class Timeline
     int32_t stepCount;
 
 public:
-    // Implement these functions
     Timeline()
     {
+        head = tail = nullptr;
+        stepCount = 0;
     }
     void record(Snapshot *s)
     {
-        // add record in the timeline
+        TimelineNode *newerecord = new TimelineNode(s);
+        if (head == nullptr)
+        {
+            head = tail = newerecord;
+            stepCount++;
+            return;
+        }
+
+        newerecord->prev = tail;
+        tail->next = newerecord;
+        tail = newerecord;
+        stepCount++;
     }
     TimelineNode *begin()
     {
+        if (head == nullptr)
+        {
+            throw(std::underflow_error("Timeline List is Empty"));
+        }
+        return head;
     }
     int32_t getStepCount()
     {
+        return stepCount;
     }
 };
 
-// Core structs
 struct Variable
 {
     string name;
@@ -167,7 +185,7 @@ struct Snapshot
 };
 struct TTDBHeader
 {
-    char magic[4]; // "TTDB"
+    char magic[4];
     int32_t version;
     int32_t stepCount;
     int64_t indexOffset;
@@ -176,19 +194,16 @@ void writeHeader(FILE *f, const TTDBHeader &h)
 {
     fwrite(h.magic, 1, 4, f);
     fwrite(&h.version, sizeof(int32_t), 1, f);
-
-    // placeholder for other two data members
 }
 
-// resolve.bin - bookkeeping
 struct FuncEntry
 {
     string funcName;
-    int64_t byteOffsetInResolveBin; // where this function's FUNC header record sits
+    int64_t byteOffsetInResolveBin;
 };
 struct PendingPatch
 {
-    int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
+    int64_t byteOffsetOfOffsetField;
     string targetFuncName;
 };
 
@@ -231,22 +246,57 @@ string secondWord(const string &line)
 {
     size_t first = line.find(' ');
     if (first == string::npos)
-        return ""; // no second word exists
-
-    size_t start = first + 1;              // skip the space
-    size_t second = line.find(' ', start); // find next space
+        return "";
+    size_t st = first + 1;
+    size_t second = line.find(' ', st);
 
     if (second == string::npos)
-        return line.substr(start); // second word goes to end of line
+        return line.substr(st);
 
-    return line.substr(start, second - start);
+    return line.substr(st, second - st);
 }
 bool validateProgram(const char *sourcePath)
 {
-    // for each func defined there should be exactly one func_end and no nested funcs allowed -
+
+    ifstream Rdr(sourcePath);
+    if (!Rdr)
+    {
+        std::cout << "File not opened! " << std::endl;
+        return false;
+    }
+    Stack<string> st;
+    string line;
+    while (getline(Rdr, line))
+    {
+        string KEYWORD = firstWord(line);
+
+        if (KEYWORD == "func")
+        {
+            if (!st.isEmpty())
+            {
+
+                Rdr.close();
+                return false;
+            }
+            st.push(KEYWORD);
+        }
+        else if (KEYWORD == "func_end")
+        {
+            if (st.isEmpty())
+            {
+
+                Rdr.close();
+                return false;
+            }
+            st.pop();
+        }
+    }
+
+    Rdr.close();
+
+    return st.isEmpty();
 }
 
-// PASS 0x1: RESOLVE() -> resolve.bin
 int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
 {
     // writes one [offset(8B)][size(4B)][string] record at the current file position
@@ -318,18 +368,19 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
 int32_t main()
 {
 
-    if (!validateProgram("source.bin"))
+    if (!validateProgram("/home/aashir/Time-Travel-Debugger-/tests/invalid_stray_end.bin"))
     {
-        // send an error response instead of a .tdbg file
+        cout << "File is invalid!" << endl;
         return 1;
     }
+    cout << "file is valid" << endl;
 
-    int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
-
-    Timeline timeline;
-    executeProgram("resolve.bin", mainOffset, timeline);
-
-    writeTdbg(timeline, "session.tdbg");
+    //     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
+    //
+    //     Timeline timeline;
+    //     executeProgram("resolve.bin", mainOffset, timeline);
+    //
+    //     writeTdbg(timeline, "session.tdbg");
 
     return 0;
 }
