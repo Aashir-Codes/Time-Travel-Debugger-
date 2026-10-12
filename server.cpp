@@ -28,11 +28,11 @@ using namespace std;
 const int32_t MAX_VARS_PER_FRAME = 16;
 const int32_t MAX_STACK_DEPTH = 64;
 const int32_t MAX_FUNCS = 128;
-const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2; // kW + func_name + upto 16 params/args
+const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2;
 const int32_t MAX_PATCHES = MAX_FUNCS * 4;
-const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024; // sanity cap on the declared file length
-const int32_t IO_BUFFER_SIZE = 64 * 1024;              // fixed buffer for streaming to/from disk
-const int32_t SOCKET_TIMEOUT_SEC = 5;                  //  apply as SO_RCVTIMEO so a deadclient can't hang the server forever
+const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024;
+const int32_t IO_BUFFER_SIZE = 64 * 1024;
+const int32_t SOCKET_TIMEOUT_SEC = 5;
 
 template <typename T>
 class Stack
@@ -109,6 +109,13 @@ public:
         }
         return i;
     }
+    ~Stack()
+    {
+        while (!isEmpty())
+        {
+            pop();
+        }
+    }
 };
 
 struct Snapshot;
@@ -124,6 +131,7 @@ struct TimelineNode
         next = prev = nullptr;
     }
 };
+
 class Timeline
 {
     TimelineNode *head, *tail;
@@ -190,13 +198,14 @@ struct TTDBHeader
     int32_t stepCount;
     int64_t indexOffset;
 };
+
 void writeHeader(FILE *f, const TTDBHeader &h)
 {
     fwrite(h.magic, 1, 4, f);
     fwrite(&h.version, sizeof(int32_t), 1, f);
 }
 
-struct FuncEntry
+struct FuncEntry // BAsically  a dictionery with name and at what offset it is located
 {
     string funcName;
     int64_t byteOffsetInResolveBin;
@@ -215,7 +224,11 @@ bool readSourceLine(ifstream &in, string &out)
     string line;
     while (getline(in, line))
     {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
 
+        if (isSkippable(line))
+            continue;
         if (!line.empty())
         {
             out = line;
@@ -224,36 +237,57 @@ bool readSourceLine(ifstream &in, string &out)
     }
     return false;
 }
-string firstWord(const string &line)
+
+bool isWhitespace(char c)
 {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
 
-    string ans = "";
+int32_t splitWords(const string &line, string out[], int32_t maxOut)
+{
+    int32_t count = 0;
+    size_t pos = 0;
 
-    for (auto ch : line)
+    while (count < maxOut)
     {
-        if (ch == ' ')
-        {
-            return ans;
-        }
+        while (pos < line.size() && isWhitespace(line[pos]))
+            pos++;
 
-        ans += ch;
+        if (pos == line.size())
+            break;
+
+        size_t start = pos;
+        while (pos < line.size() && !isWhitespace(line[pos]))
+            pos++;
+
+        out[count] = line.substr(start, pos - start);
+        count++;
     }
 
-    return line;
+    return count;
+}
+
+bool isSkippable(const string &line)
+{
+    string w[1];
+    int32_t n = splitWords(line, w, 1);
+    return n == 0 || w[0].rfind("//", 0) == 0;
+}
+
+string firstWord(const string &line)
+{
+    string words[1];
+    if (splitWords(line, words, 1) == 1)
+        return words[0];
+    return "";
 }
 
 string secondWord(const string &line)
 {
-    size_t first = line.find(' ');
-    if (first == string::npos)
-        return "";
-    size_t st = first + 1;
-    size_t second = line.find(' ', st);
-
-    if (second == string::npos)
-        return line.substr(st);
-
-    return line.substr(st, second - st);
+    string words[2];
+    if (splitWords(line, words, 2) == 2)
+        return words[1];
+    return "";
 }
 bool validateProgram(const char *sourcePath)
 {
@@ -268,6 +302,10 @@ bool validateProgram(const char *sourcePath)
     string line;
     while (getline(Rdr, line))
     {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (isSkippable(line))
+            continue;
         string KEYWORD = firstWord(line);
 
         if (KEYWORD == "func")
@@ -299,27 +337,162 @@ bool validateProgram(const char *sourcePath)
 
 int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
 {
-    // writes one [offset(8B)][size(4B)][string] record at the current file position
-    // returns this record's own starting byte position
+    int64_t RecordStart = ftell(f);
+    int32_t size = text.size();
+
+    fwrite(&offsetField, sizeof(int64_t), 1, f);
+    fwrite(&size, sizeof(int32_t), 1, f);
+    fwrite(text.c_str(), 1, size, f);
+    return RecordStart;
+
+    /*
+
+     * SO BASICALLY THE FORMULA WAS TO WRITE THE  8 BYTES AT CURRENT OFFSET (BASICALLY LIKE
+         THE VTABLE IN POLYMORPHISM WE STORED THE ADDRESS IN THE FUNCTION ARRAY WE ARE STORING THE ADDRESS OF EACH FUNCTION)
+         SO THAT WE CAN PATCH THE CALLS OF THAT SPECIFIC FUCNTION WITH THE ADDRESS OF THAT FUNCTION
+     + 4 BYTES AT SIZE AND THE RAW TEXT WITHOUT THE \n null character
+
+    */
 }
+
 int64_t readResolveRecord(FILE *f, string &outText)
 {
-    // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
+    int64_t OF; // OFFSET FIELD
+    int32_t size;
+
+    fread(&OF, sizeof(int64_t), 1, f);
+    fread(&size, sizeof(int32_t), 1, f);
+
+    char *buffer = new char[size + 1];
+    fread(buffer, 1, size, f);
+    buffer[size] = '\0';
+    outText = string(buffer);
+    delete[] buffer;
+    /*
+    SO what is this function doing in sane words it is a function that is taking a line(empty line ig) and the file which is already opened
+    it first reads the offset value where exactly is the address this is written
+    then thesize pf the char [] without the \0
+    then it eeads that  into the string with \0 returs the address of where it was written in the file
+    */
+    return OF;
 }
+
 int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 {
-    FuncEntry funcArray[MAX_FUNCS];
+    ifstream src(sourcePath);
+    if (!src)
+    {
+        cout << "Could not open source file!" << endl;
+        return -1;
+    }
+    FILE *out = fopen(resolveBinPath, "wb"); // we are reading it in wb so it can be opened in windows and linux both because windows silently corrrupt the file on reading
+    if (!out)
+    {
+        cout << "Could not open resolve.bin!" << endl;
+        return -1;
+    }
+
+    FuncEntry funcArray[MAX_FUNCS]; // Using the constraints that were provided as global vars
     int32_t funcCount = 0;
-    PendingPatch patches[MAX_PATCHES];
+    PendingPatch patches[MAX_PATCHES]; // Max numeber of patches
     int32_t patchCount = 0;
-    // Every source line becomes one record holding the raw line, as-is.
-    // resolve() only PEEKS at the leading word(s) -- enough to spot FUNC
-    // (remember its position) and CALL (remember which function it needs
-    // and where its offset field sits).
-    // Once the whole file is written, every CALL's offset field is patched
-    // with its target's position. Patching happens after the full write
-    // Returns the byte offset of main's FUNC header record.
-    // if there is no main return the error
+
+    int64_t currentOffset = 0;
+    string line;
+
+    while (getline(src, line))
+    {
+        if (!line.empty() && line.back() == '\r') // for windows cause getline ignores \r
+            line.pop_back();
+        if (isSkippable(line))
+            continue;
+        string kw = firstWord(line);
+
+        if (kw == "func")
+        {
+            string name = secondWord(line);
+            if (name.empty() || funcCount == MAX_FUNCS)
+            {
+                cout << "Bad or too many functions" << endl;
+                fclose(out);
+                return -1;
+            }
+
+            funcArray[funcCount].funcName = secondWord(line);
+            funcArray[funcCount].byteOffsetInResolveBin = currentOffset;
+            for (int32_t j = 0; j < funcCount; j++)
+            {
+                if (funcArray[j].funcName == name)
+                {
+                    cout << "Duplicate function: " << name << endl;
+                    fclose(out);
+                    return -1;
+                }
+            }
+            funcCount++;
+        }
+        else if (kw == "call")
+        {
+            if (patchCount == MAX_PATCHES)
+            {
+                cout << "Too many call instructions" << endl;
+                fclose(out);
+                return -1;
+            }
+            patches[patchCount].byteOffsetOfOffsetField = currentOffset;
+            patches[patchCount].targetFuncName = secondWord(line);
+            patchCount++;
+        }
+
+        writeResolveRecord(out, currentOffset, line);
+        currentOffset += 8 + 4 + (int64_t)line.size();
+    }
+
+    src.close();
+
+    for (int32_t i = 0; i < patchCount; i++)
+    {
+
+        int64_t targetOffset = -1;
+        for (int32_t j = 0; j < funcCount; j++)
+        {
+            if (funcArray[j].funcName == patches[i].targetFuncName)
+            {
+                targetOffset = funcArray[j].byteOffsetInResolveBin;
+                break;
+            }
+        }
+
+        if (targetOffset == -1)
+        {
+            cout << "Undefined function: " << patches[i].targetFuncName << endl;
+            fclose(out);
+            return -1;
+        }
+
+        fseek(out, patches[i].byteOffsetOfOffsetField, SEEK_SET);
+        fwrite(&targetOffset, sizeof(int64_t), 1, out);
+    }
+
+    int64_t mainOffset = -1;
+    for (int32_t i = 0; i < funcCount; i++)
+    {
+        if (funcArray[i].funcName == "main")
+        {
+            mainOffset = funcArray[i].byteOffsetInResolveBin;
+            break;
+        }
+    }
+
+    fclose(out);
+
+    if (mainOffset == -1)
+    {
+        cout << "No main function found!" << endl;
+        return -1;
+    }
+
+    return mainOffset;
 }
 
 // PASS 0x2: EXECUTION (tokenization happens here)
@@ -364,23 +537,21 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
     // after timeline add the index array i the file
     // update the header
 }
-// main section
-int32_t main()
+/*
+Instead of Hard Coding PATH I AM GOING TO TAKE PATH AT COMPILE TIME AND ALSO THIS RESEMBLES THE KWARG, ARGS CONCEPT IN PYTHON BTW
+*/
+int main(int argc, char **argv)
 {
-
-    if (!validateProgram("/home/aashir/Time-Travel-Debugger-/tests/invalid_stray_end.bin"))
+    if (argc < 2)
+    {
+        cout << "Usage: ttdb <source.bin>" << endl;
+        return 1;
+    }
+    if (!validateProgram(argv[1]))
     {
         cout << "File is invalid!" << endl;
         return 1;
     }
     cout << "file is valid" << endl;
-
-    //     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
-    //
-    //     Timeline timeline;
-    //     executeProgram("resolve.bin", mainOffset, timeline);
-    //
-    //     writeTdbg(timeline, "session.tdbg");
-
     return 0;
 }
