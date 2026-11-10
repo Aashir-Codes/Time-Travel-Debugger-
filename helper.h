@@ -101,3 +101,54 @@ inline void setRecvTimeout(sock_t s, int seconds)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 #endif
 }
+
+// ======================= SHARED CONSTANTS =======================
+const int IO_BUFFER_SIZE = 64 * 1024;
+
+// ======================= SHARED STRUCTS =======================
+struct FuncEntry
+{
+    std::string funcName;
+    int64_t byteOffsetInResolveBin; // where this function's FUNC header record sits
+};
+struct PendingPatch
+{
+    int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
+    std::string targetFuncName;
+};
+
+// ======================= SOCKET SEND / RECEIVE =======================
+// send() may send fewer bytes than asked, so loop until all n are gone.
+inline bool sendAll(sock_t sock, const char *buf, size_t n)
+{
+    size_t sent = 0;
+    while (sent < n)
+    {
+        int r = (int)send(sock, buf + sent, (int)(n - sent), MSG_NOSIGNAL);
+        if (r <= 0)
+        {
+            if (r < 0 && lastErrorWasInterrupt())
+                continue;
+            return false;
+        }
+        sent += (size_t)r;
+    }
+    return true;
+}
+// recv() may return fewer bytes than asked, so loop until exactly n have arrived.
+inline bool recvAll(sock_t sock, char *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n)
+    {
+        int r = (int)recv(sock, buf + got, (int)(n - got), 0);
+        if (r <= 0)
+        {
+            if (r < 0 && lastErrorWasInterrupt())
+                continue;
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
