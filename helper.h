@@ -181,3 +181,52 @@ inline uint32_t crcDecode(const unsigned char in[4])
 {
     return (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
 }
+
+// ======================= TrailerChecker =======================
+// Message on the wire:  [status 1][body ...][CRC 4]
+// The receiver cannot know which 4 bytes are the CRC until the stream ends,
+// so it always holds back the newest 4 bytes.
+class TrailerChecker
+{
+    uint32_t reg;          // CRC register over everything already released
+    unsigned char held[4]; // the newest 4 bytes, kept back
+    size_t heldCount;      // how many of those 4 are filled
+
+public:
+    TrailerChecker() : reg(CRC_INIT), heldCount(0) { std::memset(held, 0, sizeof held); }
+
+    // Give it a chunk (in, n). It copies the bytes that are now SAFE to use into `out`
+    // and returns how many. `out` must be a different buffer, at least n bytes big.
+    // The very first released byte of a message is the status byte.
+    size_t feed(const char *in, size_t n, char *out)
+    {
+        size_t total = heldCount + n;
+        if (total <= 4) // still inside the reserve, release nothing
+        {
+            std::memcpy(held + heldCount, in, n);
+            heldCount = total;
+            return 0;
+        }
+        size_t release = total - 4;
+        for (size_t i = 0; i < release; i++) // held bytes come first, then the new chunk
+            out[i] = (i < heldCount) ? (char)held[i] : in[i - heldCount];
+        reg = crc32Update(reg, out, release);
+
+        unsigned char nh[4]; // the last 4 of (held + in) become the new reserve
+        for (size_t j = 0; j < 4; j++)
+        {
+            size_t idx = release + j;
+            nh[j] = (idx < heldCount) ? held[idx] : (unsigned char)in[idx - heldCount];
+        }
+        std::memcpy(held, nh, 4);
+        heldCount = 4;
+        return release;
+    }
+    // True only if 4 bytes are held AND they equal the CRC of everything released.
+    bool verify() const
+    {
+        return heldCount == 4 && crcDecode(held) == crc32Finish(reg);
+    }
+    // The held 4 bytes. The load balancer forwards them ONLY if verify() is true.
+    const unsigned char *trailer() const { return held; }
+};
