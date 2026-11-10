@@ -152,3 +152,32 @@ inline bool recvAll(sock_t sock, char *buf, size_t n)
     }
     return true;
 }
+
+// ======================= CRC-32 =======================
+// Keep the running register between chunks; apply the final XOR only when you finish.
+const uint32_t CRC_INIT = 0xFFFFFFFFu;
+
+inline uint32_t crc32Update(uint32_t reg, const char *data, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        reg ^= (unsigned char)data[i];
+        for (int b = 0; b < 8; b++)
+            reg = (reg & 1u) ? ((reg >> 1) ^ 0xEDB88320u) : (reg >> 1);
+    }
+    return reg;
+}
+inline uint32_t crc32Finish(uint32_t reg) { return reg ^ 0xFFFFFFFFu; }
+
+// The 4 checksum bytes on the wire are LITTLE-ENDIAN. Decided once, here, for all three programs.
+inline void crcEncode(uint32_t crc, unsigned char out[4])
+{
+    out[0] = (unsigned char)(crc & 0xFF);
+    out[1] = (unsigned char)((crc >> 8) & 0xFF);
+    out[2] = (unsigned char)((crc >> 16) & 0xFF);
+    out[3] = (unsigned char)((crc >> 24) & 0xFF);
+}
+inline uint32_t crcDecode(const unsigned char in[4])
+{
+    return (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+}
