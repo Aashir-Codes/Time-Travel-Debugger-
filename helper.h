@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstddef>
 #include <cerrno>
+#include <cstdlib>
 
 // ======================= PORTABILITY LAYER =======================
 #ifdef _WIN32
@@ -115,6 +116,38 @@ struct PendingPatch
 {
     int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
     std::string targetFuncName;
+};
+
+// ======================= SHARED LIMITS AND SNAPSHOT TYPES =======================
+// Used by server.cpp and client.cpp. The .tdbg layout depends on these, so they live here once.
+const int32_t MAX_VARS_PER_FRAME = 16;
+const int32_t MAX_STACK_DEPTH = 64;
+
+struct Variable
+{
+    std::string name;
+    int32_t value;
+};
+struct Frame
+{
+    std::string func_name;
+    int32_t argc = 0;
+    Variable argv[MAX_VARS_PER_FRAME];
+    int32_t returnLine = -1;
+    Variable locals[MAX_VARS_PER_FRAME];
+    int32_t localCount = 0;
+};
+struct Snapshot
+{
+    Frame callStack[MAX_STACK_DEPTH];
+    int32_t stackDepth;
+};
+struct TTDBHeader
+{
+    char magic[4];
+    int32_t version;
+    int32_t stepCount;
+    int64_t indexOffset;
 };
 
 // ======================= SOCKET SEND / RECEIVE =======================
@@ -230,3 +263,128 @@ public:
     // The held 4 bytes. The load balancer forwards them ONLY if verify() is true.
     const unsigned char *trailer() const { return held; }
 };
+// ======================= ADDED FOR PHASE 2 =======================
+// Paste this at the END of helper.h.
+// ALSO add  #include <cstdlib>  to the include list at the top of helper.h.
+
+// Word splitting, moved here from server.cpp because the client needs it too.
+inline bool isWhitespace(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+inline int32_t splitWords(const std::string &line, std::string out[], int32_t maxOut)
+{
+    int32_t count = 0;
+    size_t pos = 0;
+    while (count < maxOut)
+    {
+        while (pos < line.size() && isWhitespace(line[pos]))
+            pos++;
+        if (pos == line.size())
+            break;
+        size_t start = pos;
+        while (pos < line.size() && !isWhitespace(line[pos]))
+            pos++;
+        out[count] = line.substr(start, pos - start);
+        count++;
+    }
+    return count;
+}
+
+// Streaming writer for one framed message: [status][body...][CRC 4].
+// Call write() for each piece, then finish() once. CRC covers everything written.
+class FrameWriter
+{
+    sock_t sock;
+    uint32_t reg;
+
+public:
+    explicit FrameWriter(sock_t s) : sock(s), reg(CRC_INIT) {}
+
+    bool write(const char *data, size_t n)
+    {
+        if (n == 0)
+            return true;
+        reg = crc32Update(reg, data, n);
+        return sendAll(sock, data, n);
+    }
+    bool finish()
+    {
+        unsigned char t[4];
+        crcEncode(crc32Finish(reg), t);
+        return sendAll(sock, (const char *)t, 4);
+    }
+};
+
+// A whole short message in one call: used for every error reply.
+inline bool sendFramedMessage(sock_t sock, char status, const std::string &body)
+{
+    FrameWriter w(sock);
+    char st = status;
+    return w.write(&st, 1) && w.write(body.data(), body.size()) && w.finish();
+}
+
+// Listening socket on any address. Exits the program if it cannot be created.
+inline sock_t createListenSocket(int port, int backlog)
+{
+    sock_t s = makeTcpSocket();
+    if (s == BAD_SOCK)
+    {
+        fprintf(stderr, "socket() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(s, (sockaddr *)&addr, sizeof addr) < 0)
+    {
+        fprintf(stderr, "bind() to port %d failed: %s\n", port, strerror(errno));
+        exit(1);
+    }
+    if (listen(s, backlog) < 0)
+    {
+        fprintf(stderr, "listen() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    return s;
+}
+
+// Connect to host:port. Returns BAD_SOCK on failure (and closes the socket, so nothing leaks).
+inline sock_t connectToHost(const char *host, int port)
+{
+    sock_t s = makeTcpSocket();
+    if (s == BAD_SOCK)
+        return BAD_SOCK;
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1 ||
+        connect(s, (sockaddr *)&addr, sizeof addr) < 0)
+    {
+        closeSock(s);
+        return BAD_SOCK;
+    }
+    return s;
+}
+
+// accept() a client so that child processes (the server, started with system()) do NOT
+// inherit the client socket. Without this, the server keeps the client connection open
+// and the client never sees the end of the reply. peer may be nullptr.
+inline sock_t acceptClient(sock_t listenSock, sockaddr_in *peer)
+{
+    socklen_t len = sizeof(sockaddr_in);
+    sockaddr *addr = (sockaddr *)peer;
+    socklen_t *lenp = peer ? &len : nullptr;
+#ifdef __linux__
+    return accept4(listenSock, addr, lenp, SOCK_CLOEXEC);
+#else
+    return accept(listenSock, addr, lenp);
+#endif
+}
