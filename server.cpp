@@ -13,27 +13,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <cstdlib>
+#include <vector>
 
 //----------------------------------- Windows only ---------------------------------
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else // Mac and Linux
-#include <unistd.h>
-#include <sys/socket.h>
-#endif
+#include "helper.h"
 
 using namespace std;
 
-const int32_t MAX_VARS_PER_FRAME = 16;
-const int32_t MAX_STACK_DEPTH = 64;
 const int32_t MAX_FUNCS = 128;
 const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2;
 const int32_t MAX_PATCHES = MAX_FUNCS * 4;
 const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024;
-const int32_t IO_BUFFER_SIZE = 64 * 1024;
 const int32_t SOCKET_TIMEOUT_SEC = 5;
 const int32_t MAX_RECORD_BYTES = 1024 * 1024;
+// Each snapshot is ~85 KB in memory (64 frames), so 1000 steps is about 85 MB at most.
+const int32_t MAX_STEPS = 1000;
 
 template <typename T>
 class Stack
@@ -119,26 +114,6 @@ public:
     }
 };
 
-struct Variable
-{
-    string name;
-    int32_t value;
-};
-struct Frame
-{
-    string func_name;
-    int32_t argc = 0;
-    Variable argv[MAX_VARS_PER_FRAME];
-    int32_t returnLine = -1;
-    Variable locals[MAX_VARS_PER_FRAME];
-    int32_t localCount = 0;
-};
-struct Snapshot
-{
-    Frame callStack[MAX_STACK_DEPTH];
-    int32_t stackDepth;
-};
-
 struct TimelineNode
 {
     Snapshot *data;
@@ -203,60 +178,12 @@ public:
     }
 };
 
-struct TTDBHeader
-{
-    char magic[4];
-    int32_t version;
-    int32_t stepCount;
-    int64_t indexOffset;
-};
-
 void writeHeader(FILE *f, const TTDBHeader &h)
 {
     fwrite(h.magic, 1, 4, f);
     fwrite(&h.version, sizeof(int32_t), 1, f);
     fwrite(&h.stepCount, sizeof(int32_t), 1, f);
     fwrite(&h.indexOffset, sizeof(int64_t), 1, f);
-}
-
-struct FuncEntry // BAsically  a dictionery with name and at what offset it is located
-{
-    string funcName;
-    int64_t byteOffsetInResolveBin;
-};
-struct PendingPatch
-{
-    int64_t byteOffsetOfOffsetField;
-    string targetFuncName;
-};
-
-bool isWhitespace(char c)
-{
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-int32_t splitWords(const string &line, string out[], int32_t maxOut)
-{
-    int32_t count = 0;
-    size_t pos = 0;
-
-    while (count < maxOut)
-    {
-        while (pos < line.size() && isWhitespace(line[pos]))
-            pos++;
-
-        if (pos == line.size())
-            break;
-
-        size_t start = pos;
-        while (pos < line.size() && !isWhitespace(line[pos]))
-            pos++;
-
-        out[count] = line.substr(start, pos - start);
-        count++;
-    }
-
-    return count;
 }
 
 bool isSkippable(const string &line)
@@ -281,31 +208,40 @@ string secondWord(const string &line)
         return words[1];
     return "";
 }
-bool validateProgram(const char *sourcePath)
+bool validateProgram(const char *sourcePath, string &err)
 {
-
     ifstream Rdr(sourcePath);
     if (!Rdr)
     {
-        std::cout << "File not opened! " << std::endl;
+        err = "Could not open the source file";
         return false;
     }
     Stack<string> st;
     string line;
+    int32_t lineNo = 0;
     while (getline(Rdr, line))
     {
+        lineNo++;
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
         if (isSkippable(line))
             continue;
-        string keyword = firstWord(line);
 
+        // splitWords stops silently at its limit, so ask for one more word than allowed.
+        string tooMany[MAX_TOKENS + 1];
+        if (splitWords(line, tooMany, MAX_TOKENS + 1) > MAX_TOKENS)
+        {
+            err = "line " + to_string(lineNo) + ": too many parameters (at most " +
+                  to_string(MAX_VARS_PER_FRAME) + ")";
+            return false;
+        }
+
+        string keyword = firstWord(line);
         if (keyword == "func")
         {
             if (!st.isEmpty())
             {
-
-                Rdr.close();
+                err = "line " + to_string(lineNo) + ": func inside another func (nesting is not allowed)";
                 return false;
             }
             st.push(keyword);
@@ -314,17 +250,24 @@ bool validateProgram(const char *sourcePath)
         {
             if (st.isEmpty())
             {
-
-                Rdr.close();
+                err = "line " + to_string(lineNo) + ": func_end without a matching func";
                 return false;
             }
             st.pop();
         }
+        else if (st.isEmpty())
+        {
+            err = "line " + to_string(lineNo) + ": '" + keyword + "' is outside any function";
+            return false;
+        }
     }
 
-    Rdr.close();
-
-    return st.isEmpty();
+    if (!st.isEmpty())
+    {
+        err = "a func was never closed with func_end";
+        return false;
+    }
+    return true;
 }
 
 int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
@@ -363,18 +306,18 @@ bool readResolveRecord(FILE *f, int64_t &outOffsetField, string &outText)
 
     return true;
 }
-int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
+int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath, string &err)
 {
     ifstream src(sourcePath);
     if (!src)
     {
-        cout << "Could not open source file!" << endl;
+        err = "Could not open source file!";
         return -1;
     }
     FILE *out = fopen(resolveBinPath, "wb"); // we are reading it in wb so it can be opened in windows and linux both because windows silently corrrupt the file on reading
     if (!out)
     {
-        cout << "Could not open resolve.bin!" << endl;
+        err = "Could not open resolve.bin!";
         return -1;
     }
 
@@ -399,7 +342,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
             string name = secondWord(line);
             if (name.empty() || funcCount == MAX_FUNCS)
             {
-                cout << "Bad or too many functions" << endl;
+                err = "Bad or too many functions";
                 fclose(out);
                 return -1;
             }
@@ -410,7 +353,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
             {
                 if (funcArray[j].funcName == name)
                 {
-                    cout << "Duplicate function: " << name << endl;
+                    err = "Duplicate function: " + name;
                     fclose(out);
                     return -1;
                 }
@@ -421,7 +364,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
         {
             if (patchCount == MAX_PATCHES)
             {
-                cout << "Too many call instructions" << endl;
+                err = "Too many call instructions";
                 fclose(out);
                 return -1;
             }
@@ -451,7 +394,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 
         if (targetOffset == -1)
         {
-            cout << "Undefined function: " << patches[i].targetFuncName << endl;
+            err = "Undefined function: " + patches[i].targetFuncName;
             fclose(out);
             return -1;
         }
@@ -474,14 +417,13 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 
     if (mainOffset == -1)
     {
-        cout << "No main function found!" << endl;
+        err = "No main function found!";
         return -1;
     }
 
     return mainOffset;
 }
-
-enum TokenType
+enum TokType
 {
     KEYWORD,
     IDENTIFIER,
@@ -489,7 +431,7 @@ enum TokenType
 };
 struct Token
 {
-    TokenType type;
+    TokType type;
     string text;
 };
 
@@ -693,12 +635,12 @@ void executeReturn(FILE *f, Stack<Frame> &callStack)
     }
 }
 
-bool executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
+bool executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline, string &err)
 {
     FILE *f = fopen(resolveBinPath, "rb"); // "rb": binary mode, required on Windows
     if (!f)
     {
-        cout << "Could not open resolve.bin for execution!" << endl;
+        err = "Could not open resolve.bin for execution!";
         return false;
     }
 
@@ -746,12 +688,14 @@ bool executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
             else
                 throw std::runtime_error("Unknown or misplaced instruction: " + kw);
 
+            if (timeline.getStepCount() >= MAX_STEPS)
+                throw std::runtime_error("Program is too long (more than " + to_string(MAX_STEPS) + " steps)");
             timeline.record(buildSnapshot(callStack));
         }
     }
     catch (const std::exception &e)
     {
-        cout << "Execution error: " << e.what() << endl;
+        err = string("Execution error: ") + e.what();
         fclose(f);
         return false;
     }
@@ -827,39 +771,166 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
 
     fclose(f);
 }
-/*
-Instead of Hard Coding PATH I AM GOING TO TAKE PATH AT COMPILE TIME AND ALSO THIS RESEMBLES THE KWARG, ARGS CONCEPT IN PYTHON BTW
-*/
+bool runPipeline(const char *sourcePath, const char *tdbgPath, string &err)
+{
+    if (!validateProgram(sourcePath, err))
+        return false;
+
+    int64_t mainOffset = resolveProgram(sourcePath, "resolve.bin", err);
+    if (mainOffset < 0)
+        return false;
+
+    Timeline timeline;
+    if (!executeProgram("resolve.bin", mainOffset, timeline, err))
+        return false;
+
+    try
+    {
+        writeTdbg(timeline, tdbgPath);
+    }
+    catch (const std::exception &e)
+    {
+        err = string("Could not write .tdbg: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+// Reads [status][source][CRC] from the load balancer into `path`.
+bool receiveUpload(sock_t sock, const char *path, string &err)
+{
+    FILE *out = fopen(path, "wb");
+    if (!out)
+    {
+        err = "server could not create its upload file";
+        return false;
+    }
+
+    TrailerChecker check;
+    vector<char> in(IO_BUFFER_SIZE), safe(IO_BUFFER_SIZE);
+    bool gotStatus = false;
+    char status = 0;
+    uint64_t bodyBytes = 0;
+    bool tooLarge = false;
+    bool writeFailed = false;
+
+    while (true)
+    {
+        int r = recv(sock, in.data(), (int)in.size(), 0);
+        if (r < 0 && lastErrorWasInterrupt())
+            continue;
+        if (r <= 0)
+            break; // client finished, or timed out
+
+        size_t n = check.feed(in.data(), (size_t)r, safe.data());
+        size_t from = 0;
+        if (n > 0 && !gotStatus)
+        {
+            gotStatus = true;
+            status = safe[0]; // the first released byte is the status
+            from = 1;
+        }
+        size_t body = n - from;
+        bodyBytes += body;
+        if (bodyBytes > MAX_SOURCE_BYTES)
+        {
+            tooLarge = true;
+            break;
+        }
+        if (body > 0 && fwrite(safe.data() + from, 1, body, out) != body)
+        {
+            writeFailed = true;
+            break;
+        }
+    }
+    fclose(out);
+
+    if (tooLarge)
+    {
+        remove(path);
+        err = "source too large";
+        return false;
+    }
+    if (writeFailed)
+    {
+        remove(path);
+        err = "server could not save the upload";
+        return false;
+    }
+    if (!check.verify())
+    {
+        remove(path);
+        err = "upload checksum mismatch";
+        return false;
+    }
+    if (!gotStatus || status != 0)
+    {
+        remove(path);
+        err = "unexpected message from load balancer";
+        return false;
+    }
+    return true;
+}
+
+// Sends session file as [0][bytes][CRC]. Streams it, never loads it all into memory.
+void sendTdbgFile(sock_t sock, const char *tdbgPath)
+{
+    FILE *f = fopen(tdbgPath, "rb");
+    if (!f)
+    {
+        sendFramedMessage(sock, 1, "server could not read its session file");
+        return;
+    }
+    FrameWriter w(sock);
+    char status = 0;
+    bool ok = w.write(&status, 1);
+    vector<char> buf(IO_BUFFER_SIZE);
+    size_t n;
+    while (ok && (n = fread(buf.data(), 1, buf.size(), f)) > 0)
+        ok = w.write(buf.data(), n);
+    fclose(f);
+    if (ok)
+        w.finish();
+}
+
+// One client, start to finish. Every failure becomes a status-1 reply with the reason.
+void handleClient(sock_t sock)
+{
+    string err;
+    bool ok = receiveUpload(sock, "upload.bin", err) &&
+              runPipeline("upload.bin", "session.tdbg", err);
+    if (!ok)
+    {
+        cout << "request failed: " << err << endl;
+        sendFramedMessage(sock, 1, err);
+        return;
+    }
+    cout << "request ok" << endl;
+    sendTdbgFile(sock, "session.tdbg");
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        cout << "Usage: ttdb <source.bin>" << endl;
+        cerr << "Usage: ./server <port>" << endl;
         return 1;
     }
-    if (!validateProgram(argv[1]))
-    {
-        cout << "File is invalid!" << endl;
-        return 1;
-    }
-    cout << "file is valid" << endl;
+    int port = atoi(argv[1]);
 
-    int64_t mainOffset = resolveProgram(argv[1], "resolve.bin");
-    if (mainOffset < 0)
-        return 1;
+    netInit(); // ignores SIGPIPE, so a dropped client cannot kill us
+    sock_t listenSock = createListenSocket(port, 4);
+    cout << "server listening on port " << port << endl;
 
-    Timeline timeline;
-    if (!executeProgram("resolve.bin", mainOffset, timeline))
-        return 1;
-    try
+    // One client at a time. The load balancer already queues the others.
+    while (true)
     {
-        writeTdbg(timeline, "session.tdbg");
+        sock_t client = acceptClient(listenSock, nullptr);
+        if (client == BAD_SOCK)
+            continue;
+        setRecvTimeout(client, SOCKET_TIMEOUT_SEC); // a stalled client cannot freeze us
+        handleClient(client);
+        closeSock(client);
     }
-    catch (const std::exception &e)
-    {
-        cout << "Could not write .tdbg: " << e.what() << endl;
-        return 1;
-    }
-    cout << "session.tdbg written" << endl;
     return 0;
 }
